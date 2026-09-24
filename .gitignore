@@ -1,0 +1,10 @@
+node_modules/
+android/app/build/
+android/build/
+android/.gradle/
+android/app/release.keystore
+android/gradle.properties
+modules/battery-monitor/android/build/
+modules/battery-monitor/android/.cxx/
+.expo/
+*.apk

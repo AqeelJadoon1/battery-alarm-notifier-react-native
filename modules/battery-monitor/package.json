@@ -1,0 +1,14 @@
+{
+  "name": "battery-monitor",
+  "version": "1.0.0",
+  "description": "Native battery foreground service module",
+  "main": "index.ts",
+  "expo": {
+    "autolinking": {
+      "source": "android"
+    }
+  },
+  "peerDependencies": {
+    "expo": "*"
+  }
+}
