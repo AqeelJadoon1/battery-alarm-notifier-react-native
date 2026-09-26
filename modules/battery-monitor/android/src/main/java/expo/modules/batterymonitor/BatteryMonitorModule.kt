@@ -154,19 +154,25 @@ class BatteryMonitorModule : Module() {
       true
     }
 
-    OnActivityResult { _, payload ->
+        OnActivityResult { _, payload ->
       if (payload.requestCode == REQUEST_PICK_RINGTONE) {
-        val uri = payload.data?.getParcelableExtra<Uri>(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
         val type = pendingChannelType
-        if (type != null) {
-          BatteryForegroundService.saveSoundUri(context, type, uri?.toString())
-          val intent = Intent(BatteryForegroundService.ACTION_UPDATE_SOUND).apply {
-            setPackage(context.packageName)
-            putExtra(BatteryForegroundService.EXTRA_CHANNEL_TYPE, type)
+        if (payload.resultCode == android.app.Activity.RESULT_OK) {
+          val uri = payload.data?.getParcelableExtra<Uri>(RingtoneManager.EXTRA_RINGTONE_PICKED_URI)
+          if (type != null) {
+            BatteryForegroundService.saveSoundUri(context, type, uri?.toString())
+            val intent = Intent(BatteryForegroundService.ACTION_UPDATE_SOUND).apply {
+              setPackage(context.packageName)
+              putExtra(BatteryForegroundService.EXTRA_CHANNEL_TYPE, type)
+            }
+            context.sendBroadcast(intent)
           }
-          context.sendBroadcast(intent)
+          pendingPromise?.resolve(uri?.toString())
+        } else {
+          // User backed out — leave the existing sound untouched.
+          val existing = type?.let { BatteryForegroundService.getSoundUri(context, it) }
+          pendingPromise?.resolve(existing)
         }
-        pendingPromise?.resolve(uri?.toString())
         pendingPromise = null
         pendingChannelType = null
       }

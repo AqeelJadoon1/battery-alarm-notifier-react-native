@@ -46,7 +46,14 @@ class BatteryForegroundService : Service() {
         .putInt("${channelType}_sound_version", newVersion)
         .apply()
     }
-
+    private fun loadFiredState(ctx: Context): Triple<Boolean, Boolean, Boolean> {
+      val p = ctx.getSharedPreferences("battery_monitor_prefs", Context.MODE_PRIVATE)
+      return Triple(
+        p.getBoolean("full_fired", false),
+        p.getBoolean("threshold_fired", false),
+        p.getBoolean("threshold_armed", false)
+      )
+    }
     private fun channelId(ctx: Context, channelType: String): String =
       "${channelType}_alert_v${getSoundVersion(ctx, channelType)}"
   }
@@ -57,8 +64,9 @@ class BatteryForegroundService : Service() {
   private var fullChargeFired = false
   private var thresholdFired = false
     private var thresholdArmed = false // true once we've seen the level dip below threshold
+      private var fullChargeArmed = true // starts armed so a fresh 100% still notifies once
 
-  private val batteryReceiver = object : BroadcastReceiver() {
+    private val batteryReceiver = object : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
       val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
       val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
@@ -70,9 +78,10 @@ class BatteryForegroundService : Service() {
                         status == BatteryManager.BATTERY_STATUS_FULL
 
       if (!isCharging) {
-        fullChargeFired = false
-        thresholdFired = false
-        thresholdArmed = false // unplugged: require a fresh dip-below-threshold next time
+        // Don't blindly reset "already fired" here — only actual level
+        // drops (handled below/in handleBatteryLevel) should re-arm.
+        // This is what stops a brief unplug-replug at 100% from re-firing.
+        thresholdArmed = false
         return
       }
       handleBatteryLevel(percent)
@@ -102,6 +111,11 @@ class BatteryForegroundService : Service() {
   override fun onCreate() {
     super.onCreate()
     createChannels()
+        val (savedFullFired, savedThresholdFired, savedThresholdArmed) = loadFiredState(this)
+    fullChargeFired = savedFullFired
+    thresholdFired = savedThresholdFired
+    thresholdArmed = savedThresholdArmed
+    fullChargeArmed = !savedFullFired // if it already fired, stay un-armed until a real dip
     registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
     val filter = IntentFilter().apply {
       addAction(ACTION_UPDATE_THRESHOLD)
@@ -153,23 +167,39 @@ class BatteryForegroundService : Service() {
       .putInt("threshold", threshold)
       .apply()
   }
-
-    private fun handleBatteryLevel(percent: Int) {
-    if (percent < 100) fullChargeFired = false
+  private fun persistFiredState() {
+    getSharedPreferences("battery_monitor_prefs", Context.MODE_PRIVATE)
+      .edit()
+      .putBoolean("full_fired", fullChargeFired)
+      .putBoolean("threshold_fired", thresholdFired)
+      .putBoolean("threshold_armed", thresholdArmed)
+      .apply()
+  }
+     private fun handleBatteryLevel(percent: Int) {
+    if (percent < 100) {
+      fullChargeFired = false
+      fullChargeArmed = true // genuinely dropped below 100, safe to fire again next time
+    }
     if (percent < threshold) {
       thresholdFired = false
-      thresholdArmed = true // confirmed we're genuinely below the mark now
+      thresholdArmed = true
     }
 
-    if (percent >= 100 && !fullChargeFired) {
+    if (percent >= 100 && !fullChargeFired && fullChargeArmed) {
       fullChargeFired = true
+      fullChargeArmed = false
       fireAlert("full", FULL_CHARGE_NOTIF_ID, "Fully Charged", "Battery reached 100% — unplug soon.")
     } else if (percent in threshold..99 && !thresholdFired && thresholdArmed) {
       thresholdFired = true
       fireAlert("threshold", THRESHOLD_NOTIF_ID, "Charge Threshold Reached", "Battery reached your $threshold% mark.")
     }
+    persistFiredState()
   }
-  private fun fireAlert(channelType: String, notifId: Int, title: String, text: String) {
+      private fun fireAlert(channelType: String, notifId: Int, title: String, text: String) {
+    val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+    manager.cancel(FULL_CHARGE_NOTIF_ID)
+    manager.cancel(THRESHOLD_NOTIF_ID)
+
     playAlarmSound(channelType)
 
     val stopIntent = Intent(ACTION_STOP_ALARM).apply { setPackage(packageName) }
@@ -188,7 +218,6 @@ class BatteryForegroundService : Service() {
       .addAction(0, "Stop", stopPending)
       .build()
 
-    val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
     manager.notify(notifId, notification)
 
     autoStopTimer?.cancel()
@@ -198,27 +227,48 @@ class BatteryForegroundService : Service() {
     }.start()
   }
 
-  private fun playAlarmSound(channelType: String) {
+   private fun playAlarmSound(channelType: String) {
     stopAlarm()
     val savedUri = getSoundUri(this, channelType)
-    val soundUri = if (savedUri != null) {
+    val primaryUri = if (savedUri != null) {
       Uri.parse(savedUri)
     } else if (channelType == "full") {
       RingtoneManager.getActualDefaultRingtoneUri(this, RingtoneManager.TYPE_ALARM)
     } else {
       RingtoneManager.getActualDefaultRingtoneUri(this, RingtoneManager.TYPE_NOTIFICATION)
     }
-    mediaPlayer = MediaPlayer().apply {
-      setAudioAttributes(
-        AudioAttributes.Builder()
-          .setUsage(AudioAttributes.USAGE_ALARM)
-          .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-          .build()
-      )
-      setDataSource(this@BatteryForegroundService, soundUri)
-      isLooping = true
-      prepare()
-      start()
+
+    if (!tryPlaySound(primaryUri)) {
+      // Chosen sound is gone/invalid — fall back to system default rather
+      // than crashing the service.
+      val fallback = if (channelType == "full") {
+        RingtoneManager.getActualDefaultRingtoneUri(this, RingtoneManager.TYPE_ALARM)
+      } else {
+        RingtoneManager.getActualDefaultRingtoneUri(this, RingtoneManager.TYPE_NOTIFICATION)
+      }
+      tryPlaySound(fallback)
+    }
+  }
+
+  private fun tryPlaySound(uri: Uri): Boolean {
+    return try {
+      mediaPlayer = MediaPlayer().apply {
+        setAudioAttributes(
+          AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_ALARM)
+            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+            .build()
+        )
+        setDataSource(this@BatteryForegroundService, uri)
+        isLooping = true
+        prepare()
+        start()
+      }
+      true
+    } catch (e: Exception) {
+      mediaPlayer?.release()
+      mediaPlayer = null
+      false
     }
   }
 
